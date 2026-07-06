@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,22 @@ func TestParseProductURL(t *testing.T) {
 	}
 	if ref.Path != "/product/sharf-snud-essentials-696919507/" {
 		t.Fatalf("unexpected path: %q", ref.Path)
+	}
+}
+
+func TestExecuteHelpWritesUsageAndReturnsZero(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := execute([]string{"--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", exitCode)
+	}
+	if !strings.Contains(stdout.String(), "Usage:") {
+		t.Fatalf("expected help in stdout, got: %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected empty stderr, got: %q", stderr.String())
 	}
 }
 

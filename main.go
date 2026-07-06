@@ -86,10 +86,20 @@ func (e *antiBotError) Error() string {
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	os.Exit(execute(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func execute(args []string, stdout, stderr io.Writer) int {
+	err := run(args)
+	if err == nil {
+		return 0
 	}
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(stdout, usageText())
+		return 0
+	}
+	fmt.Fprintln(stderr, "error:", err)
+	return 1
 }
 
 func run(args []string) error {
@@ -207,6 +217,24 @@ func flagExpectsValue(name string) bool {
 	default:
 		return true
 	}
+}
+
+func usageText() string {
+	return `Usage:
+  ozon-card-media-scraper [flags] <ozon-product-url>
+
+Flags:
+  --output <dir>         Base output directory (default: .)
+  --reviews-pages <n>    Maximum number of review pages to request
+  --cookie <value>       Raw Cookie header value
+  --cookie-file <path>   Path to a file containing Cookie header value
+  --proxy <url>          HTTP(S) proxy URL
+  --timeout <sec>        Request timeout in seconds
+  --write-html           Save fetched product HTML for debugging
+  --user-agent <ua>      Custom User-Agent
+  --date <yyyymmdd>      Override output suffix date for testing/debug
+  --help                 Show this help
+`
 }
 
 func parseFlags(args []string) (CLIOptions, string, error) {
