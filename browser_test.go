@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestNormalizeReviewMediaMergesImagesAndVideos(t *testing.T) {
 	reviews := []BrowserReview{{
@@ -34,5 +38,28 @@ func TestBuildBrowserCandidatesAddsReviewsSuffix(t *testing.T) {
 	}
 	if candidates[1] != "/product/demo-product-123/reviews" {
 		t.Fatalf("unexpected second candidate: %q", candidates[1])
+	}
+}
+
+func TestBrowserPageLooksUsableAllowsRRIfContentVisible(t *testing.T) {
+	snapshot := BrowserSnapshot{CardImages: []string{"https://cdn.ozon.ru/t/test.jpg"}}
+	html := `<html><body><h1>Шарф снуд Essentials</h1><div>В корзину</div></body></html>`
+	if !browserPageLooksUsable("https://www.ozon.ru/product/demo/?__rr=1&abt_att=1", html, snapshot) {
+		t.Fatal("expected visible product page with __rr to be treated as usable")
+	}
+}
+
+func TestResolveCookieValueReadsFilePathPassedToCookieFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	if err := os.WriteFile(cookieFile, []byte("session=abc; region=ru"), 0o644); err != nil {
+		t.Fatalf("write cookie file: %v", err)
+	}
+	got, err := resolveCookieValue(CLIOptions{Cookie: cookieFile})
+	if err != nil {
+		t.Fatalf("resolveCookieValue returned error: %v", err)
+	}
+	if got != "session=abc; region=ru" {
+		t.Fatalf("unexpected cookie value: %q", got)
 	}
 }

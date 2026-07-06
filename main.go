@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -432,16 +433,34 @@ func buildHeaders(opts CLIOptions, referer string, html bool) http.Header {
 	if referer != "" {
 		h.Set("Referer", referer)
 	}
-	cookie := strings.TrimSpace(opts.Cookie)
-	if cookie == "" && opts.CookieFile != "" {
-		if b, err := os.ReadFile(opts.CookieFile); err == nil {
-			cookie = strings.TrimSpace(string(b))
-		}
-	}
-	if cookie != "" {
+	cookie, err := resolveCookieValue(opts)
+	if err == nil && cookie != "" {
 		h.Set("Cookie", cookie)
 	}
 	return h
+}
+
+func resolveCookieValue(opts CLIOptions) (string, error) {
+	cookie := strings.TrimSpace(opts.Cookie)
+	if cookie == "" && opts.CookieFile != "" {
+		b, err := os.ReadFile(opts.CookieFile)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	if cookie == "" {
+		return "", nil
+	}
+	if strings.Contains(cookie, ";") || strings.Contains(cookie, "=") {
+		return cookie, nil
+	}
+	if strings.ContainsAny(cookie, `/\\`) || strings.HasSuffix(strings.ToLower(cookie), ".txt") {
+		if b, err := os.ReadFile(cookie); err == nil {
+			return strings.TrimSpace(string(b)), nil
+		}
+	}
+	return cookie, nil
 }
 
 func doRequest(client *http.Client, method, rawURL string, body []byte, headers http.Header) (HTTPResult, error) {
@@ -878,11 +897,9 @@ func scrapeWithBrowser(sourceURL string, ref ProductRef, opts CLIOptions) (Brows
 	if err != nil {
 		return BrowserSnapshot{}, "", nil, err
 	}
-	cookieHeader := strings.TrimSpace(opts.Cookie)
-	if cookieHeader == "" && opts.CookieFile != "" {
-		if b, err := os.ReadFile(opts.CookieFile); err == nil {
-			cookieHeader = strings.TrimSpace(string(b))
-		}
+	cookieHeader, err := resolveCookieValue(opts)
+	if err != nil {
+		return BrowserSnapshot{}, "", nil, err
 	}
 
 	runtimeDir, err := os.MkdirTemp("", "ozon-chromium-runtime-*")
@@ -913,6 +930,10 @@ func scrapeWithBrowser(sourceURL string, ref ProductRef, opts CLIOptions) (Brows
 
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
+
+	logWriter := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(logWriter)
 
 	timeout := opts.Timeout + opts.BrowserWait + 20*time.Second
 	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
@@ -951,7 +972,7 @@ func scrapeWithBrowser(sourceURL string, ref ProductRef, opts CLIOptions) (Brows
 	); err != nil {
 		return BrowserSnapshot{}, "", warnings, fmt.Errorf("browser mode failed: %w", err)
 	}
-	if strings.Contains(location, "__rr=1") || strings.Contains(location, "block.html") || isAntiBotBlocked(200, []byte(html)) {
+	if !browserPageLooksUsable(location, html, snapshot) {
 		return BrowserSnapshot{}, html, warnings, &antiBotError{message: "browser mode still hit Ozon anti-bot. Run with visible browser on your desktop: --browser-mode --no-headless --browser-wait 20"}
 	}
 
@@ -1021,29 +1042,70 @@ func filterBrowserURLs(items []string) []string {
 	return out
 }
 
+func browserPageLooksUsable(location, html string, snapshot BrowserSnapshot) bool {
+	lowerLocation := strings.ToLower(location)
+	lowerHTML := strings.ToLower(html)
+	if !strings.Contains(lowerLocation, "__rr=1") && !strings.Contains(lowerLocation, "block.html") && !isAntiBotBlocked(200, []byte(html)) {
+		return true
+	}
+	if len(snapshot.CardImages) > 0 || len(snapshot.CardVideos) > 0 || len(snapshot.ReviewImages) > 0 || len(snapshot.ReviewVideos) > 0 || len(snapshot.Reviews) > 0 {
+		return true
+	}
+	productMarkers := []string{"в корзину", "купить сейчас", "о товаре", "отзывы", "артикул:", "доставка", "ozon fresh"}
+	for _, marker := range productMarkers {
+		if strings.Contains(lowerHTML, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 const browserExtractJS = `(() => {
   const abs = (value) => {
     if (!value) return "";
     try { return new URL(value, location.href).href; } catch { return ""; }
   };
   const uniq = (items) => [...new Set(items.map((v) => (v || "").trim()).filter(Boolean))];
-  const mediaAttrs = ["src", "href", "content", "poster"];
+  const addBackgrounds = (bucket, node) => {
+    const style = node.getAttribute && node.getAttribute("style");
+    if (!style) return;
+    const matches = style.match(/url\(([^)]+)\)/gi) || [];
+    for (const match of matches) {
+      const raw = match.replace(/^url\((.*)\)$/i, "$1").replace(/^['\"]|['\"]$/g, "");
+      const url = abs(raw);
+      if (url) bucket.push(url);
+    }
+  };
+  const attrNames = [
+    "src", "href", "content", "poster", "data-src", "data-origin", "data-large-image",
+    "data-preview", "data-video", "data-url", "data-image", "data-img", "srcset", "data-srcset"
+  ];
   const collectFromRoot = (root) => {
     const images = [];
     const videos = [];
-    const nodes = root.querySelectorAll("img,source,video,a,meta");
+    const nodes = root.querySelectorAll("img,source,video,a,meta,[style],[data-src],[data-srcset],[data-origin],[data-large-image],[data-video]");
     nodes.forEach((node) => {
-      for (const attr of mediaAttrs) {
-        const value = node.getAttribute && node.getAttribute(attr);
-        if (!value) continue;
-        const url = abs(value);
-        if (!url) continue;
-        if (/\.(mp4|mov|webm|m3u8)(\?|$)/i.test(url) || /video/i.test(url)) {
-          videos.push(url);
-        } else {
-          images.push(url);
+      if (node.currentSrc) {
+        const url = abs(node.currentSrc);
+        if (url) {
+          if (/\.(mp4|mov|webm|m3u8)(\?|$)/i.test(url) || /video/i.test(url)) videos.push(url); else images.push(url);
         }
       }
+      for (const attr of attrNames) {
+        const value = node.getAttribute && node.getAttribute(attr);
+        if (!value) continue;
+        for (const part of String(value).split(",")) {
+          const candidate = part.trim().split(/\s+/)[0];
+          const url = abs(candidate);
+          if (!url) continue;
+          if (/\.(mp4|mov|webm|m3u8)(\?|$)/i.test(url) || /video/i.test(url)) {
+            videos.push(url);
+          } else {
+            images.push(url);
+          }
+        }
+      }
+      addBackgrounds(images, node);
     });
     return { images: uniq(images), videos: uniq(videos) };
   };
