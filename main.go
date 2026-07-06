@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -17,6 +19,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 )
 
 const defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
@@ -69,6 +74,26 @@ type CLIOptions struct {
 	ReviewsPages int
 	DateOverride string
 	WriteHTML    bool
+	BrowserMode  bool
+	BrowserPath  string
+	Headless     bool
+	BrowserWait  time.Duration
+}
+
+type BrowserSnapshot struct {
+	CardImages   []string        `json:"cardImages"`
+	CardVideos   []string        `json:"cardVideos"`
+	ReviewImages []string        `json:"reviewImages"`
+	ReviewVideos []string        `json:"reviewVideos"`
+	Reviews      []BrowserReview `json:"reviews"`
+}
+
+type BrowserReview struct {
+	ID      string   `json:"id"`
+	Author  string   `json:"author,omitempty"`
+	Comment string   `json:"comment,omitempty"`
+	Photos  []string `json:"photos,omitempty"`
+	Videos  []string `json:"videos,omitempty"`
 }
 
 type HTTPResult struct {
@@ -135,35 +160,60 @@ func run(args []string) error {
 		return err
 	}
 
-	pageResult, err := doRequest(client, http.MethodGet, sourceURL, nil, buildHeaders(opts, sourceURL, true))
-	if err != nil {
-		return err
-	}
-	if isAntiBotRedirect(pageResult) || isAntiBotBlocked(pageResult.StatusCode, pageResult.Body) {
-		writeErrorJSON(rootDir, sourceURL, pageResult.Body)
-		return &antiBotError{message: "Ozon anti-bot blocked the product page request. Try running from a residential/mobile IP, with valid browser cookies, or through a trusted proxy."}
+	var cardMedia []MediaItem
+	var reviews []ReviewRecord
+	var warnings []string
+
+	if opts.BrowserMode {
+		snapshot, html, browserWarnings, err := scrapeWithBrowser(sourceURL, ref, opts)
+		if err != nil {
+			writeErrorJSON(rootDir, sourceURL, []byte(err.Error()))
+			return err
+		}
+		warnings = append(warnings, browserWarnings...)
+		if opts.WriteHTML && html != "" {
+			_ = os.WriteFile(filepath.Join(rootDir, "product.html"), []byte(html), 0o644)
+		}
+		for _, raw := range append(snapshot.CardImages, snapshot.CardVideos...) {
+			cardMedia = append(cardMedia, MediaItem{URL: raw, Kind: classifyMediaKind(raw)})
+		}
+		cardMedia = dedupeMedia(cardMedia)
+		reviews = normalizeBrowserReviews(snapshot.Reviews)
+		for _, raw := range snapshot.ReviewImages {
+			reviews = appendReviewLooseMedia(reviews, raw, "image")
+		}
+		for _, raw := range snapshot.ReviewVideos {
+			reviews = appendReviewLooseMedia(reviews, raw, "video")
+		}
+	} else {
+		pageResult, err := doRequest(client, http.MethodGet, sourceURL, nil, buildHeaders(opts, sourceURL, true))
+		if err != nil {
+			return err
+		}
+		if isAntiBotRedirect(pageResult) || isAntiBotBlocked(pageResult.StatusCode, pageResult.Body) {
+			writeErrorJSON(rootDir, sourceURL, pageResult.Body)
+			return &antiBotError{message: "Ozon anti-bot blocked the product page request. Try browser mode on the same desktop: --browser-mode --no-headless."}
+		}
+
+		html := string(pageResult.Body)
+		if opts.WriteHTML {
+			_ = os.WriteFile(filepath.Join(rootDir, "product.html"), pageResult.Body, 0o644)
+		}
+
+		cardMedia, warnings = extractCardMedia(sourceURL, ref, html)
+		cardMedia = dedupeMedia(cardMedia)
+		reviews, _ = fetchReviews(client, opts, sourceURL, ref)
 	}
 
-	html := string(pageResult.Body)
-	if opts.WriteHTML {
-		_ = os.WriteFile(filepath.Join(rootDir, "product.html"), pageResult.Body, 0o644)
-	}
-
-	cardMedia, warnings := extractCardMedia(sourceURL, ref, html)
-	cardMedia = dedupeMedia(cardMedia)
 	if len(cardMedia) == 0 {
-		warnings = append(warnings, "Не удалось извлечь медиа карточки из HTML/JSON страницы.")
+		warnings = append(warnings, "Не удалось извлечь медиа карточки товара.")
 	}
-
 	for i, media := range cardMedia {
 		name := fmt.Sprintf("%03d%s", i+1, detectExt(media.URL, media.Kind))
 		if err := downloadToFile(client, media.URL, filepath.Join(cardDir, name), buildHeaders(opts, sourceURL, false)); err != nil {
 			warnings = append(warnings, fmt.Sprintf("card download failed for %s: %v", media.URL, err))
 		}
 	}
-
-	reviews, reviewWarnings := fetchReviews(client, opts, sourceURL, ref)
-	warnings = append(warnings, reviewWarnings...)
 
 	for _, review := range reviews {
 		reviewMediaDir := filepath.Join(reviewDir, sanitizeName(review.ID))
@@ -212,7 +262,7 @@ func run(args []string) error {
 
 func flagExpectsValue(name string) bool {
 	switch name {
-	case "--write-html":
+	case "--write-html", "--browser-mode", "--no-headless":
 		return false
 	default:
 		return true
@@ -233,6 +283,10 @@ Flags:
   --write-html           Save fetched product HTML for debugging
   --user-agent <ua>      Custom User-Agent
   --date <yyyymmdd>      Override output suffix date for testing/debug
+  --browser-mode         Use real Chromium browser mode instead of raw HTTP mode
+  --browser-path <path>  Chromium/Chrome executable path (default: chromium-browser lookup)
+  --browser-wait <sec>   Seconds to wait for page hydration in browser mode (default: 12)
+  --no-headless          Run Chromium with UI (recommended on local desktop)
   --help                 Show this help
 `
 }
@@ -241,7 +295,7 @@ func parseFlags(args []string) (CLIOptions, string, error) {
 	fs := flag.NewFlagSet("ozon-card-media-scraper", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	opts := CLIOptions{}
+	opts := CLIOptions{Headless: true}
 	fs.StringVar(&opts.OutputDir, "output", ".", "base output directory")
 	fs.StringVar(&opts.Cookie, "cookie", "", "raw Cookie header value")
 	fs.StringVar(&opts.CookieFile, "cookie-file", "", "path to a file containing Cookie header value")
@@ -250,8 +304,14 @@ func parseFlags(args []string) (CLIOptions, string, error) {
 	fs.IntVar(&opts.ReviewsPages, "reviews-pages", 20, "maximum number of review pages to request")
 	fs.StringVar(&opts.DateOverride, "date", "", "date suffix override in yyyymmdd format (testing/debug)")
 	fs.BoolVar(&opts.WriteHTML, "write-html", false, "save fetched product HTML for debugging")
+	fs.BoolVar(&opts.BrowserMode, "browser-mode", false, "use real Chromium browser mode")
+	fs.StringVar(&opts.BrowserPath, "browser-path", "", "Chromium/Chrome executable path")
+	var noHeadless bool
+	fs.BoolVar(&noHeadless, "no-headless", false, "run Chromium with visible UI")
 	var timeoutSec int
+	var browserWaitSec int
 	fs.IntVar(&timeoutSec, "timeout", 30, "request timeout in seconds")
+	fs.IntVar(&browserWaitSec, "browser-wait", 12, "seconds to wait for page hydration in browser mode")
 
 	var sourceURL string
 	flagArgs := make([]string, 0, len(args))
@@ -285,9 +345,16 @@ func parseFlags(args []string) (CLIOptions, string, error) {
 	if timeoutSec <= 0 {
 		timeoutSec = 30
 	}
+	if browserWaitSec <= 0 {
+		browserWaitSec = 12
+	}
 	opts.Timeout = time.Duration(timeoutSec) * time.Second
+	opts.BrowserWait = time.Duration(browserWaitSec) * time.Second
 	if opts.ReviewsPages <= 0 {
 		opts.ReviewsPages = 1
+	}
+	if noHeadless {
+		opts.Headless = false
 	}
 	return opts, sourceURL, nil
 }
@@ -521,6 +588,68 @@ func buildReviewURLCandidates(productPath string) []string {
 	}
 }
 
+func buildBrowserCandidates(ref ProductRef) []string {
+	clean := strings.TrimSuffix(ref.Path, "/")
+	return []string{
+		clean + "/",
+		clean + "/reviews",
+	}
+}
+
+func normalizeBrowserReviews(items []BrowserReview) []ReviewRecord {
+	out := make([]ReviewRecord, 0, len(items))
+	for idx, item := range items {
+		review := ReviewRecord{
+			ID:      firstNonEmpty(item.ID, fmt.Sprintf("review-%03d", idx+1)),
+			Author:  item.Author,
+			Comment: item.Comment,
+		}
+		seen := map[string]bool{}
+		for _, raw := range item.Photos {
+			raw = strings.TrimSpace(raw)
+			if raw == "" || seen[raw] {
+				continue
+			}
+			seen[raw] = true
+			review.Media = append(review.Media, MediaItem{URL: raw, Kind: "image"})
+		}
+		for _, raw := range item.Videos {
+			raw = strings.TrimSpace(raw)
+			if raw == "" || seen[raw] {
+				continue
+			}
+			seen[raw] = true
+			review.Media = append(review.Media, MediaItem{URL: raw, Kind: "video"})
+		}
+		out = append(out, review)
+	}
+	return out
+}
+
+func appendReviewLooseMedia(reviews []ReviewRecord, raw, kind string) []ReviewRecord {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return reviews
+	}
+	for i := range reviews {
+		for _, media := range reviews[i].Media {
+			if media.URL == raw {
+				return reviews
+			}
+		}
+	}
+	for i := range reviews {
+		if reviews[i].ID == "review-media-unassigned" {
+			reviews[i].Media = append(reviews[i].Media, MediaItem{URL: raw, Kind: kind})
+			return reviews
+		}
+	}
+	return append(reviews, ReviewRecord{
+		ID:    "review-media-unassigned",
+		Media: []MediaItem{{URL: raw, Kind: kind}},
+	})
+}
+
 func parseReviewResponse(body []byte, sourceURL string) ([]ReviewRecord, bool) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -680,7 +809,7 @@ func collectMediaFromAny(node any, sourceURL string) []MediaItem {
 			switch value := v.(type) {
 			case string:
 				if looksLikeMediaURL(value) {
-					out = append(out, MediaItem{URL: absolutizeURL(sourceURL, value), Kind: classifyMediaKind(key+":"+value)})
+					out = append(out, MediaItem{URL: absolutizeURL(sourceURL, value), Kind: classifyMediaKind(key + ":" + value)})
 				}
 			case []any, map[string]any:
 				out = append(out, collectMediaFromAny(value, sourceURL)...)
@@ -743,6 +872,209 @@ func dedupeMedia(items []MediaItem) []MediaItem {
 	}
 	return out
 }
+
+func scrapeWithBrowser(sourceURL string, ref ProductRef, opts CLIOptions) (BrowserSnapshot, string, []string, error) {
+	browserPath, err := resolveBrowserPath(opts.BrowserPath)
+	if err != nil {
+		return BrowserSnapshot{}, "", nil, err
+	}
+	cookieHeader := strings.TrimSpace(opts.Cookie)
+	if cookieHeader == "" && opts.CookieFile != "" {
+		if b, err := os.ReadFile(opts.CookieFile); err == nil {
+			cookieHeader = strings.TrimSpace(string(b))
+		}
+	}
+
+	runtimeDir, err := os.MkdirTemp("", "ozon-chromium-runtime-*")
+	if err != nil {
+		return BrowserSnapshot{}, "", nil, err
+	}
+	defer os.RemoveAll(runtimeDir)
+	userDataDir, err := os.MkdirTemp("", "ozon-chromium-profile-*")
+	if err != nil {
+		return BrowserSnapshot{}, "", nil, err
+	}
+	defer os.RemoveAll(userDataDir)
+
+	allocatorOpts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.ExecPath(browserPath),
+		chromedp.NoSandbox,
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.Flag("no-first-run", true),
+		chromedp.Flag("no-default-browser-check", true),
+		chromedp.Flag("user-data-dir", userDataDir),
+		chromedp.Flag("headless", opts.Headless),
+		chromedp.UserAgent(opts.UserAgent),
+		chromedp.Env("XDG_RUNTIME_DIR="+runtimeDir),
+	)
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), allocatorOpts...)
+	defer cancelAlloc()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	timeout := opts.Timeout + opts.BrowserWait + 20*time.Second
+	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
+	defer cancelTimeout()
+
+	headers := network.Headers(map[string]any{
+		"Accept-Language":           "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+		"Cache-Control":             "max-age=0",
+		"Upgrade-Insecure-Requests": "1",
+		"Sec-Fetch-Site":            "none",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-User":            "?1",
+		"Sec-Fetch-Dest":            "document",
+		"sec-ch-ua":                 `"Not.A/Brand";v="8", "Chromium";v="137", "Google Chrome";v="137"`,
+		"sec-ch-ua-mobile":          "?0",
+		"sec-ch-ua-platform":        `"Linux"`,
+	})
+	if cookieHeader != "" {
+		headers["Cookie"] = cookieHeader
+	}
+
+	var snapshot BrowserSnapshot
+	var html string
+	var location string
+	warnings := []string{}
+
+	if err := chromedp.Run(ctx,
+		network.Enable(),
+		network.SetExtraHTTPHeaders(headers),
+		chromedp.Navigate(sourceURL),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+		chromedp.Sleep(opts.BrowserWait),
+		chromedp.Location(&location),
+		chromedp.OuterHTML("html", &html, chromedp.ByQuery),
+		chromedp.Evaluate(browserExtractJS, &snapshot),
+	); err != nil {
+		return BrowserSnapshot{}, "", warnings, fmt.Errorf("browser mode failed: %w", err)
+	}
+	if strings.Contains(location, "__rr=1") || strings.Contains(location, "block.html") || isAntiBotBlocked(200, []byte(html)) {
+		return BrowserSnapshot{}, html, warnings, &antiBotError{message: "browser mode still hit Ozon anti-bot. Run with visible browser on your desktop: --browser-mode --no-headless --browser-wait 20"}
+	}
+
+	for _, candidate := range buildBrowserCandidates(ref)[1:] {
+		candidateURL := absolutizeURL(sourceURL, candidate)
+		var extra BrowserSnapshot
+		var pageHTML string
+		if err := chromedp.Run(ctx,
+			chromedp.Navigate(candidateURL),
+			chromedp.WaitReady("body", chromedp.ByQuery),
+			chromedp.Sleep(opts.BrowserWait),
+			chromedp.OuterHTML("html", &pageHTML, chromedp.ByQuery),
+			chromedp.Evaluate(browserExtractJS, &extra),
+		); err != nil {
+			warnings = append(warnings, fmt.Sprintf("browser candidate failed for %s: %v", candidateURL, err))
+			continue
+		}
+		if html == "" {
+			html = pageHTML
+		}
+		snapshot.CardImages = append(snapshot.CardImages, extra.CardImages...)
+		snapshot.CardVideos = append(snapshot.CardVideos, extra.CardVideos...)
+		snapshot.ReviewImages = append(snapshot.ReviewImages, extra.ReviewImages...)
+		snapshot.ReviewVideos = append(snapshot.ReviewVideos, extra.ReviewVideos...)
+		snapshot.Reviews = append(snapshot.Reviews, extra.Reviews...)
+	}
+
+	snapshot.CardImages = filterBrowserURLs(snapshot.CardImages)
+	snapshot.CardVideos = filterBrowserURLs(snapshot.CardVideos)
+	snapshot.ReviewImages = filterBrowserURLs(snapshot.ReviewImages)
+	snapshot.ReviewVideos = filterBrowserURLs(snapshot.ReviewVideos)
+	return snapshot, html, warnings, nil
+}
+
+func resolveBrowserPath(explicit string) (string, error) {
+	for _, candidate := range []string{strings.TrimSpace(explicit), "chromium-browser", "google-chrome", "chromium", "chrome"} {
+		if candidate == "" {
+			continue
+		}
+		if strings.Contains(candidate, "/") {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, nil
+			}
+			continue
+		}
+		if found, err := exec.LookPath(candidate); err == nil {
+			return found, nil
+		}
+	}
+	return "", errors.New("Chromium/Chrome executable not found; install chromium-browser or pass --browser-path")
+}
+
+func filterBrowserURLs(items []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || seen[raw] {
+			continue
+		}
+		if !isKnownMediaHost(raw) && !looksLikeMediaURL(raw) {
+			continue
+		}
+		seen[raw] = true
+		out = append(out, raw)
+	}
+	return out
+}
+
+const browserExtractJS = `(() => {
+  const abs = (value) => {
+    if (!value) return "";
+    try { return new URL(value, location.href).href; } catch { return ""; }
+  };
+  const uniq = (items) => [...new Set(items.map((v) => (v || "").trim()).filter(Boolean))];
+  const mediaAttrs = ["src", "href", "content", "poster"];
+  const collectFromRoot = (root) => {
+    const images = [];
+    const videos = [];
+    const nodes = root.querySelectorAll("img,source,video,a,meta");
+    nodes.forEach((node) => {
+      for (const attr of mediaAttrs) {
+        const value = node.getAttribute && node.getAttribute(attr);
+        if (!value) continue;
+        const url = abs(value);
+        if (!url) continue;
+        if (/\.(mp4|mov|webm|m3u8)(\?|$)/i.test(url) || /video/i.test(url)) {
+          videos.push(url);
+        } else {
+          images.push(url);
+        }
+      }
+    });
+    return { images: uniq(images), videos: uniq(videos) };
+  };
+  const card = collectFromRoot(document);
+  const reviewRoots = Array.from(document.querySelectorAll('[data-review-uuid], [data-widget*="review"], article'));
+  const reviews = [];
+  const looseReviewImages = [];
+  const looseReviewVideos = [];
+  reviewRoots.forEach((root, index) => {
+    const media = collectFromRoot(root);
+    if (media.images.length === 0 && media.videos.length === 0) return;
+    looseReviewImages.push(...media.images);
+    looseReviewVideos.push(...media.videos);
+    const textNode = root.querySelector('[data-widget*="text"], [itemprop="reviewBody"], p, span');
+    const authorNode = root.querySelector('[itemprop="author"], [data-widget*="author"]');
+    reviews.push({
+      id: root.getAttribute('data-review-uuid') || root.id || ('review-' + String(index + 1).padStart(3, '0')),
+      author: authorNode ? (authorNode.textContent || '').trim() : '',
+      comment: textNode ? (textNode.textContent || '').trim() : '',
+      photos: media.images,
+      videos: media.videos,
+    });
+  });
+  return {
+    cardImages: card.images,
+    cardVideos: card.videos,
+    reviewImages: uniq(looseReviewImages),
+    reviewVideos: uniq(looseReviewVideos),
+    reviews,
+  };
+})()`
 
 func downloadToFile(client *http.Client, rawURL, filename string, headers http.Header) error {
 	res, err := doRequest(client, http.MethodGet, rawURL, nil, headers)
