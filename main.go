@@ -447,20 +447,149 @@ func resolveCookieValue(opts CLIOptions) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return strings.TrimSpace(string(b)), nil
+		return normalizeCookieHeader(string(b)), nil
 	}
 	if cookie == "" {
 		return "", nil
 	}
 	if strings.Contains(cookie, ";") || strings.Contains(cookie, "=") {
-		return cookie, nil
+		return normalizeCookieHeader(cookie), nil
 	}
 	if strings.ContainsAny(cookie, `/\\`) || strings.HasSuffix(strings.ToLower(cookie), ".txt") {
 		if b, err := os.ReadFile(cookie); err == nil {
-			return strings.TrimSpace(string(b)), nil
+			return normalizeCookieHeader(string(b)), nil
 		}
 	}
-	return cookie, nil
+	return normalizeCookieHeader(cookie), nil
+}
+
+func normalizeCookieHeader(raw string) string {
+	raw = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "Cookie:"))
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "{") || strings.HasPrefix(raw, "[") {
+		if parsed := cookiesFromJSON(raw); parsed != "" {
+			return parsed
+		}
+	}
+	if strings.Contains(raw, "	") {
+		if parsed := cookiesFromNetscape(raw); parsed != "" {
+			return parsed
+		}
+	}
+	if strings.ContainsAny(raw, "\r\n") {
+		parts := splitCookieLines(raw)
+		if len(parts) > 0 {
+			return strings.Join(parts, "; ")
+		}
+	}
+	return strings.Join(splitCookiePairs(raw), "; ")
+}
+
+func splitCookieLines(raw string) []string {
+	var out []string
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "Cookie:")
+		if strings.Count(line, "	") >= 6 {
+			fields := strings.Split(line, "	")
+			if len(fields) >= 7 {
+				name := strings.TrimSpace(fields[5])
+				value := strings.TrimSpace(fields[6])
+				if name != "" {
+					out = append(out, name+"="+value)
+				}
+				continue
+			}
+		}
+		for _, pair := range splitCookiePairs(line) {
+			out = append(out, pair)
+		}
+	}
+	return dedupeStrings(out)
+}
+
+func splitCookiePairs(raw string) []string {
+	segments := strings.Split(raw, ";")
+	out := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		if !strings.Contains(segment, "=") {
+			continue
+		}
+		name, value, _ := strings.Cut(segment, "=")
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(value, "\r", ""), "\n", ""))
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if lower == "path" || lower == "domain" || lower == "expires" || lower == "max-age" || lower == "secure" || lower == "httponly" || lower == "samesite" {
+			continue
+		}
+		out = append(out, name+"="+value)
+	}
+	return dedupeStrings(out)
+}
+
+func cookiesFromNetscape(raw string) string {
+	pairs := splitCookieLines(raw)
+	return strings.Join(pairs, "; ")
+}
+
+func cookiesFromJSON(raw string) string {
+	var arrayPayload []map[string]any
+	if err := json.Unmarshal([]byte(raw), &arrayPayload); err == nil {
+		pairs := make([]string, 0, len(arrayPayload))
+		for _, item := range arrayPayload {
+			name := strings.TrimSpace(asString(item["name"]))
+			value := strings.TrimSpace(asString(item["value"]))
+			if name != "" {
+				pairs = append(pairs, name+"="+value)
+			}
+		}
+		return strings.Join(dedupeStrings(pairs), "; ")
+	}
+	var objectPayload map[string]any
+	if err := json.Unmarshal([]byte(raw), &objectPayload); err == nil {
+		if cookies, ok := objectPayload["cookies"].([]any); ok {
+			pairs := []string{}
+			for _, entry := range cookies {
+				item, ok := entry.(map[string]any)
+				if !ok {
+					continue
+				}
+				name := strings.TrimSpace(asString(item["name"]))
+				value := strings.TrimSpace(asString(item["value"]))
+				if name != "" {
+					pairs = append(pairs, name+"="+value)
+				}
+			}
+			return strings.Join(dedupeStrings(pairs), "; ")
+		}
+	}
+	return ""
+}
+
+func dedupeStrings(items []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	return out
 }
 
 func doRequest(client *http.Client, method, rawURL string, body []byte, headers http.Header) (HTTPResult, error) {

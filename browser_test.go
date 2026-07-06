@@ -63,3 +63,21 @@ func TestResolveCookieValueReadsFilePathPassedToCookieFlag(t *testing.T) {
 		t.Fatalf("unexpected cookie value: %q", got)
 	}
 }
+
+func TestNormalizeCookieHeaderFlattensMultilineHeader(t *testing.T) {
+	raw := "Cookie: session=abc\nregion=ru\nsecure-token=xyz\n"
+	got := normalizeCookieHeader(raw)
+	want := "session=abc; region=ru; secure-token=xyz"
+	if got != want {
+		t.Fatalf("unexpected normalized header: got %q want %q", got, want)
+	}
+}
+
+func TestNormalizeCookieHeaderParsesNetscapeExport(t *testing.T) {
+	raw := "# Netscape HTTP Cookie File\n.ozon.ru	TRUE	/	FALSE	0	session	abc\n.ozon.ru	TRUE	/	FALSE	0	region	ru\n"
+	got := normalizeCookieHeader(raw)
+	want := "session=abc; region=ru"
+	if got != want {
+		t.Fatalf("unexpected normalized netscape header: got %q want %q", got, want)
+	}
+}
