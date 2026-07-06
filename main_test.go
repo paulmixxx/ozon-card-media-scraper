@@ -116,10 +116,16 @@ func TestRunDownloadsCardAndReviewMedia(t *testing.T) {
 		switch filepath.Ext(r.URL.Path) {
 		case ".mp4":
 			w.Header().Set("Content-Type", "video/mp4")
-			_, _ = w.Write([]byte("video-bytes"))
+			_, _ = w.Write([]byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2', 0x00, 0x00, 0x00, 0x00})
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00})
+		case ".webp":
+			w.Header().Set("Content-Type", "image/webp")
+			_, _ = w.Write([]byte{'R', 'I', 'F', 'F', 0x24, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P'})
 		default:
 			w.Header().Set("Content-Type", "image/jpeg")
-			_, _ = w.Write([]byte("image-bytes"))
+			_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43})
 		}
 	})
 

@@ -175,10 +175,9 @@ func run(args []string) error {
 		if opts.WriteHTML && html != "" {
 			_ = os.WriteFile(filepath.Join(rootDir, "product.html"), []byte(html), 0o644)
 		}
-		for _, raw := range append(snapshot.CardImages, snapshot.CardVideos...) {
-			cardMedia = append(cardMedia, MediaItem{URL: raw, Kind: classifyMediaKind(raw)})
-		}
-		cardMedia = dedupeMedia(cardMedia)
+		htmlCardMedia, htmlWarnings := extractCardMedia(sourceURL, ref, html)
+		warnings = append(warnings, htmlWarnings...)
+		cardMedia = preferBrowserHTMLMedia(htmlCardMedia, snapshot)
 		reviews = normalizeBrowserReviews(snapshot.Reviews)
 		for _, raw := range snapshot.ReviewImages {
 			reviews = appendReviewLooseMedia(reviews, raw, "image")
@@ -744,6 +743,40 @@ func buildBrowserCandidates(ref ProductRef) []string {
 	}
 }
 
+func preferBrowserHTMLMedia(htmlMedia []MediaItem, snapshot BrowserSnapshot) []MediaItem {
+	if len(htmlMedia) > 0 {
+		result := append([]MediaItem(nil), htmlMedia...)
+		hasImage := false
+		hasVideo := false
+		for _, item := range result {
+			if item.Kind == "video" {
+				hasVideo = true
+			} else {
+				hasImage = true
+			}
+		}
+		if !hasImage {
+			for _, raw := range snapshot.CardImages {
+				result = append(result, MediaItem{URL: raw, Kind: classifyMediaKind(raw)})
+			}
+		}
+		if !hasVideo {
+			for _, raw := range snapshot.CardVideos {
+				result = append(result, MediaItem{URL: raw, Kind: classifyMediaKind(raw)})
+			}
+		}
+		return dedupeMedia(result)
+	}
+	result := make([]MediaItem, 0, len(snapshot.CardImages)+len(snapshot.CardVideos))
+	for _, raw := range snapshot.CardImages {
+		result = append(result, MediaItem{URL: raw, Kind: classifyMediaKind(raw)})
+	}
+	for _, raw := range snapshot.CardVideos {
+		result = append(result, MediaItem{URL: raw, Kind: classifyMediaKind(raw)})
+	}
+	return dedupeMedia(result)
+}
+
 func normalizeBrowserReviews(items []BrowserReview) []ReviewRecord {
 	out := make([]ReviewRecord, 0, len(items))
 	for idx, item := range items {
@@ -1275,7 +1308,85 @@ func downloadToFile(client *http.Client, rawURL, filename string, headers http.H
 	if res.StatusCode >= 400 {
 		return fmt.Errorf("status %d", res.StatusCode)
 	}
+	kind := classifyMediaKind(rawURL)
+	if err := validateMediaResponse(rawURL, kind, res); err != nil {
+		return err
+	}
 	return os.WriteFile(filename, res.Body, 0o644)
+}
+
+func validateMediaResponse(rawURL, kind string, res HTTPResult) error {
+	contentType := strings.ToLower(strings.TrimSpace(res.Header.Get("Content-Type")))
+	if idx := strings.Index(contentType, ";"); idx >= 0 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+	if contentType == "text/html" || contentType == "application/json" || contentType == "text/plain" {
+		return fmt.Errorf("unexpected content-type %s for %s", contentType, rawURL)
+	}
+	body := res.Body
+	if len(body) == 0 {
+		return fmt.Errorf("empty body for %s", rawURL)
+	}
+	if looksLikeHTML(body) {
+		return fmt.Errorf("unexpected HTML body for %s", rawURL)
+	}
+	if kind == "video" {
+		if isRecognizedVideoContent(contentType, body) {
+			return nil
+		}
+		return fmt.Errorf("response body is not recognized as video for %s", rawURL)
+	}
+	if isRecognizedImageContent(contentType, body) {
+		return nil
+	}
+	return fmt.Errorf("response body is not recognized as image for %s", rawURL)
+}
+
+func looksLikeHTML(body []byte) bool {
+	sample := strings.ToLower(string(body[:min(len(body), 512)]))
+	return strings.Contains(sample, "<html") || strings.Contains(sample, "<!doctype html") || strings.Contains(sample, "<body")
+}
+
+func isRecognizedImageContent(contentType string, body []byte) bool {
+	if strings.HasPrefix(contentType, "image/") {
+		return true
+	}
+	if len(body) >= 3 && body[0] == 0xff && body[1] == 0xd8 && body[2] == 0xff {
+		return true
+	}
+	if len(body) >= 8 && bytes.Equal(body[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return true
+	}
+	if len(body) >= 6 && (bytes.Equal(body[:6], []byte("GIF87a")) || bytes.Equal(body[:6], []byte("GIF89a"))) {
+		return true
+	}
+	if len(body) >= 12 && bytes.Equal(body[:4], []byte("RIFF")) && bytes.Equal(body[8:12], []byte("WEBP")) {
+		return true
+	}
+	return false
+}
+
+func isRecognizedVideoContent(contentType string, body []byte) bool {
+	if strings.HasPrefix(contentType, "video/") || contentType == "application/vnd.apple.mpegurl" || contentType == "application/x-mpegurl" {
+		return true
+	}
+	if len(body) >= 8 && bytes.Equal(body[4:8], []byte("ftyp")) {
+		return true
+	}
+	if len(body) >= 4 && bytes.Equal(body[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}) {
+		return true
+	}
+	if strings.HasPrefix(string(body[:min(len(body), 16)]), "#EXTM3U") {
+		return true
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func detectExt(rawURL, kind string) string {

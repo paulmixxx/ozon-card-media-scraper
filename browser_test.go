@@ -81,3 +81,32 @@ func TestNormalizeCookieHeaderParsesNetscapeExport(t *testing.T) {
 		t.Fatalf("unexpected normalized netscape header: got %q want %q", got, want)
 	}
 }
+
+func TestPreferBrowserHTMLMediaPrioritizesEmbeddedGallery(t *testing.T) {
+	htmlMedia := []MediaItem{{URL: "https://cdn.ozon.ru/product-main.jpg", Kind: "image"}}
+	snapshot := BrowserSnapshot{
+		CardImages: []string{"https://cdn.ozon.ru/broken-placeholder.jpg"},
+		CardVideos: []string{"https://cdn.ozon.ru/demo.mp4"},
+	}
+	got := preferBrowserHTMLMedia(htmlMedia, snapshot)
+	if len(got) != 2 {
+		t.Fatalf("expected html image plus fallback video, got %d items", len(got))
+	}
+	if got[0].URL != "https://cdn.ozon.ru/product-main.jpg" {
+		t.Fatalf("expected embedded gallery image first, got %q", got[0].URL)
+	}
+	if got[1].URL != "https://cdn.ozon.ru/demo.mp4" {
+		t.Fatalf("expected snapshot video fallback, got %q", got[1].URL)
+	}
+}
+
+func TestValidateMediaResponseRejectsHTMLWithImageExtension(t *testing.T) {
+	res := HTTPResult{
+		StatusCode: 200,
+		Header:     map[string][]string{"Content-Type": {"text/html; charset=utf-8"}},
+		Body:       []byte("<!doctype html><html><body>anti bot</body></html>"),
+	}
+	if err := validateMediaResponse("https://cdn.ozon.ru/product.jpg", "image", res); err == nil {
+		t.Fatal("expected HTML anti-bot body to be rejected")
+	}
+}
